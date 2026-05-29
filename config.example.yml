@@ -1,0 +1,34 @@
+price-monitor:
+  polymarket-ws-url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  kalshi-ws-url: wss://api.elections.kalshi.com/trade-api/ws/v2
+  kalshi-access-key-env: KALSHI_ACCESS_KEY
+  kalshi-private-key-env: KALSHI_PRIVATE_KEY
+  kalshi-private-key-path-env: KALSHI_PRIVATE_KEY_PATH
+  min-arbitrage-profit: 0.02
+  polymarket-sports-taker-fee-rate: 0.03
+  kalshi-taker-fee-rate: 0.07
+  price-lead-threshold: 0.03
+  latency-move-threshold: 0.05
+  latency-stable-threshold: 0.01
+  latency-window-ms: 30000
+  manual-matches:
+    - match-id: manual-mlb-sd-wsh-2026-05-29-moneyline
+      name: Padres vs. Nationals Moneyline
+      polymarket-event-id: polymarket#mlb-sd-wsh-2026-05-29
+      kalshi-event-id: kalshi#KXMLBGAME-26MAY291845SDWSH
+      polymarket-url: https://polymarket.com/sports/mlb/mlb-sd-wsh-2026-05-29
+      kalshi-url: https://kalshi.com/markets/kxmlbgame/professional-baseball-game/kxmlbgame-26may291845sdwsh
+      polymarket-contracts:
+        - outcome-key: padres
+          outcome-name: Padres
+          yes-instrument-id: "21397422589879803522488375172913562805167469503053305050103496090884867406737"
+        - outcome-key: nationals
+          outcome-name: Nationals
+          yes-instrument-id: "8589315888960875332332797137454929625257904729097387308223061136689771454702"
+      kalshi-contracts:
+        - outcome-key: padres
+          outcome-name: Padres
+          yes-instrument-id: KXMLBGAME-26MAY291845SDWSH-SD
+        - outcome-key: nationals
+          outcome-name: Nationals
+          yes-instrument-id: KXMLBGAME-26MAY291845SDWSH-WSH
