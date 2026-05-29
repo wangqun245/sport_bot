@@ -531,6 +531,12 @@ def websocket_connect(url: str, headers: dict[str, str] | None):
 def load_config(path: Path) -> dict[str, Any]:
     if yaml is None:
         raise RuntimeError("Missing dependency PyYAML. Install with: pip install -r python_bot/requirements.txt")
+    if not path.exists():
+        for ext in (".yml", ".yaml"):
+            alt_path = path.parent / (path.name + ext)
+            if alt_path.exists():
+                path = alt_path
+                break
     with path.open("r", encoding="utf-8") as file:
         loaded = yaml.safe_load(file) or {}
     return loaded.get("autotradebot", {}).get("price-monitor") or loaded.get("price-monitor") or {}
