@@ -11,6 +11,22 @@ price-monitor:
   latency-move-threshold: 0.05
   latency-stable-threshold: 0.01
   latency-window-ms: 30000
+  execution:
+    enabled: true
+    dry-run: true
+    polymarket-vs-kalshi-edge-threshold: 0.05
+    sell-when-polymarket-over-kalshi: 0.01
+    trade-amount-usd: 5.00
+    cooldown-ms: 300000
+    max-open-orders: 1
+    result-sweep-enabled: true
+    result-sweep-kalshi-certainty-price: 0.99
+    result-sweep-max-usd: 25.00
+    polymarket-user-ws-url: wss://ws-subscriptions-clob.polymarket.com/ws/user
+    polymarket-private-key-env: PRIVATE_KEY
+    polymarket-safe-address-env: SAFE_ADDRESS
+    polymarket-funder-address-env: FUNDER_ADDRESS
+    polymarket-signature-type: 0
   manual-matches:
     - match-id: manual-mlb-sd-wsh-2026-05-29-moneyline
       name: Padres vs. Nationals Moneyline

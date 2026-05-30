@@ -10,6 +10,7 @@ import os
 import signal
 import time
 import urllib.request
+from urllib.parse import parse_qs, quote, urlparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,7 @@ except ModuleNotFoundError:  # pragma: no cover - depends on local environment
 
 LOG = logging.getLogger("sports-price-bot")
 KALSHI_WS_PATH = "/trade-api/ws/v2"
+POLYMARKET_USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,39 @@ class PriceState:
         if self.yes_bid is None or self.yes_ask is None:
             return None
         return (self.yes_bid + self.yes_ask) / 2.0
+
+
+@dataclass
+class PendingBuy:
+    side: str
+    order_id: str
+    match_id: str
+    outcome_key: str
+    outcome_name: str
+    token_id: str
+    price: float
+    shares: float
+    amount_usd: float
+    edge: float
+    polymarket_ask: float
+    kalshi_bid: float
+    dry_run: bool
+    created_at_ms: int
+    status: str = "PENDING"
+
+
+@dataclass
+class Position:
+    match_id: str
+    outcome_key: str
+    outcome_name: str
+    token_id: str
+    shares: float
+    avg_price: float
+    amount_usd: float
+    entry_edge: float
+    dry_run: bool
+    opened_at_ms: int
 
 
 class JsonlWriter:
@@ -132,6 +167,557 @@ class PriceBook:
 
     def prices_for_match(self, match_id: str) -> list[PriceState]:
         return [price for price in self.prices.values() if price.match_id == match_id]
+
+    def prices_for_outcome(self, match_id: str, outcome_key: str) -> list[PriceState]:
+        return [
+            price for price in self.prices.values()
+            if price.match_id == match_id and price.outcome_key == outcome_key
+        ]
+
+
+class TradeManager:
+    def __init__(self, config: dict[str, Any], writer: JsonlWriter, contracts: list[Contract]):
+        execution = config.get("execution") or {}
+        self.enabled = bool(execution.get("enabled", False))
+        self.dry_run = bool(execution.get("dry-run", True))
+        self.edge_threshold = float(execution.get("polymarket-vs-kalshi-edge-threshold", 0.05))
+        self.exit_edge_threshold = float(execution.get("sell-when-polymarket-over-kalshi", 0.01))
+        self.trade_amount_usd = float(execution.get("trade-amount-usd", 5.0))
+        self.cooldown_ms = int(execution.get("cooldown-ms", 300_000))
+        self.max_open_orders = int(execution.get("max-open-orders", 1))
+        self.result_sweep_enabled = bool(execution.get("result-sweep-enabled", True))
+        self.result_sweep_certainty_price = float(execution.get("result-sweep-kalshi-certainty-price", 0.99))
+        self.result_sweep_max_usd = float(execution.get("result-sweep-max-usd", 25.0))
+        self.user_ws_url = execution.get("polymarket-user-ws-url") or POLYMARKET_USER_WS_URL
+        self.private_key_env = execution.get("polymarket-private-key-env", "PRIVATE_KEY")
+        self.safe_address_env = execution.get("polymarket-safe-address-env", "SAFE_ADDRESS")
+        self.funder_address_env = execution.get("polymarket-funder-address-env", "FUNDER_ADDRESS")
+        self.signature_type = int(execution.get("polymarket-signature-type", os.getenv("SIGNATURE_TYPE", "0")))
+        self.writer = writer
+        self.contracts_by_platform_outcome = {
+            (contract.platform_id, contract.match_id, contract.outcome_key): contract
+            for contract in contracts
+        }
+        self.pending_by_order_id: dict[str, PendingBuy] = {}
+        self.positions: dict[tuple[str, str], Position] = {}
+        self.last_signal_at: dict[tuple[str, str], int] = {}
+        self.result_sweep_done: set[tuple[str, str]] = set()
+        self.executor = None
+        self.telegram = self._load_telegram()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._ws_ready = asyncio.Event()
+
+    def _load_telegram(self):
+        try:
+            from telegram_notifier import TelegramNotifier
+            return TelegramNotifier()
+        except Exception as exc:
+            LOG.warning("telegram notifier disabled: %s", exc)
+            return None
+
+    def initialize(self) -> None:
+        if not self.enabled:
+            return
+        if self.dry_run:
+            LOG.info(
+                "trade manager enabled in DRY RUN mode threshold=%.3f amount=%.2f",
+                self.edge_threshold,
+                self.trade_amount_usd,
+            )
+            self._notify(
+                "*Sports price bot started*\n"
+                "Mode: *DRY RUN*\n"
+                f"Trigger: Polymarket ask at least {self.edge_threshold * 100:.1f}% below Kalshi bid\n"
+                f"Exit: Polymarket bid at least {self.exit_edge_threshold * 100:.1f}% above Kalshi bid\n"
+                f"Dry-run amount: ${self.trade_amount_usd:.2f}"
+            )
+            return
+        try:
+            from executor import Executor
+        except Exception as exc:
+            raise RuntimeError(
+                "Live execution requires executor.py dependencies. Install py-clob-client-v2 and python-dotenv."
+            ) from exc
+        self.executor = Executor(
+            private_key=os.getenv(self.private_key_env, ""),
+            safe_address=os.getenv(self.safe_address_env, ""),
+            dry_run=False,
+            signature_type=self.signature_type,
+            funder_address=os.getenv(self.funder_address_env, ""),
+        )
+        if not self.executor.initialize():
+            raise RuntimeError("Polymarket executor initialization failed; live trading disabled.")
+        self._notify(
+            "*Sports price bot started*\n"
+            "Mode: *LIVE*\n"
+            f"Trigger: Polymarket ask at least {self.edge_threshold * 100:.1f}% below Kalshi bid\n"
+            f"Exit: Polymarket bid at least {self.exit_edge_threshold * 100:.1f}% above Kalshi bid\n"
+            f"Order amount: ${self.trade_amount_usd:.2f}"
+        )
+
+    async def start_user_ws(self, stop_event: asyncio.Event) -> None:
+        if not self.enabled or self.dry_run:
+            return
+        if self.executor is None:
+            LOG.warning("polymarket user ws skipped: executor not initialized")
+            return
+        creds = self.executor.get_api_creds()
+        if creds is None:
+            LOG.warning("polymarket user ws skipped: missing CLOB api creds")
+            return
+        auth = {
+            "apiKey": getattr(creds, "api_key", None) or getattr(creds, "key", None),
+            "secret": getattr(creds, "api_secret", None) or getattr(creds, "secret", None),
+            "passphrase": getattr(creds, "api_passphrase", None) or getattr(creds, "passphrase", None),
+        }
+        if not all(auth.values()):
+            LOG.warning("polymarket user ws skipped: incomplete CLOB api creds")
+            return
+        while not stop_event.is_set():
+            try:
+                LOG.info("polymarket user ws connecting")
+                async with websocket_connect(self.user_ws_url, None) as websocket:
+                    await websocket.send(json.dumps({"auth": auth, "type": "user"}, separators=(",", ":")))
+                    self._ws_ready.set()
+                    LOG.info("polymarket user ws subscribed")
+                    async for message in websocket:
+                        received_ms = now_ms()
+                        await self._record_user_raw(message, received_ms)
+                        await self.handle_user_message(message, received_ms)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._ws_ready.clear()
+                LOG.warning("polymarket user ws error: %s", exc)
+                await asyncio.sleep(5)
+
+    async def _record_user_raw(self, message: str | bytes, received_ms: int) -> None:
+        text = message.decode("utf-8", errors="replace") if isinstance(message, bytes) else message
+        record = {
+            "received_at_ms": received_ms,
+            "received_at": iso_ms(received_ms),
+            "platform_id": "polymarket",
+            "source": "user_websocket",
+            "raw_payload": text,
+        }
+        try:
+            record["payload"] = json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        await self.writer.append("raw_polymarket_user", record)
+
+    async def evaluate(self, book: PriceBook, updated_price: PriceState) -> None:
+        if not self.enabled or updated_price.platform_id not in {"polymarket", "kalshi"}:
+            return
+        await self._maybe_sweep_on_kalshi_ws_result(book, updated_price)
+        await self._maybe_sell_polymarket(book, updated_price.match_id, updated_price.outcome_key)
+        if len(self.pending_by_order_id) >= self.max_open_orders:
+            return
+        await self._maybe_buy_polymarket(book, updated_price.match_id, updated_price.outcome_key)
+
+    async def _maybe_buy_polymarket(self, book: PriceBook, match_id: str, outcome_key: str) -> None:
+        if (match_id, outcome_key) in self.positions:
+            return
+        polymarket = None
+        kalshi = None
+        for price in book.prices_for_outcome(match_id, outcome_key):
+            if price.platform_id == "polymarket":
+                polymarket = price
+            elif price.platform_id == "kalshi":
+                kalshi = price
+        if polymarket is None or kalshi is None or polymarket.yes_ask is None or kalshi.yes_bid is None:
+            return
+        edge = kalshi.yes_bid - polymarket.yes_ask
+        if edge < self.edge_threshold:
+            return
+        signal_key = (match_id, outcome_key)
+        at_ms = now_ms()
+        if at_ms - self.last_signal_at.get(signal_key, 0) < self.cooldown_ms:
+            return
+        self.last_signal_at[signal_key] = at_ms
+        contract = self.contracts_by_platform_outcome.get(("polymarket", match_id, outcome_key))
+        if contract is None:
+            LOG.warning("trade skipped: no polymarket contract for %s %s", match_id, outcome_key)
+            return
+        await self._submit_buy(contract, polymarket, kalshi, edge, at_ms, self.trade_amount_usd, "edge_entry")
+
+    async def _maybe_sell_polymarket(self, book: PriceBook, match_id: str, outcome_key: str) -> None:
+        position = self.positions.get((match_id, outcome_key))
+        if position is None:
+            return
+        polymarket = None
+        kalshi = None
+        for price in book.prices_for_outcome(match_id, outcome_key):
+            if price.platform_id == "polymarket":
+                polymarket = price
+            elif price.platform_id == "kalshi":
+                kalshi = price
+        if polymarket is None or kalshi is None or polymarket.yes_bid is None or kalshi.yes_bid is None:
+            return
+        exit_edge = polymarket.yes_bid - kalshi.yes_bid
+        if exit_edge < self.exit_edge_threshold:
+            return
+        if len(self.pending_by_order_id) >= self.max_open_orders:
+            return
+        await self._submit_sell(position, polymarket.yes_bid, kalshi.yes_bid, exit_edge, "polymarket_over_kalshi")
+
+    async def _submit_buy(self, contract: Contract, polymarket: PriceState, kalshi: PriceState, edge: float, at_ms: int, amount_usd: float, reason: str) -> None:
+        order_price = round(float(polymarket.yes_ask), 2)
+        if self.dry_run:
+            shares = amount_usd / order_price if order_price > 0 else 0.0
+            pending = PendingBuy(
+                side="BUY",
+                order_id=f"DRY-{at_ms}",
+                match_id=contract.match_id,
+                outcome_key=contract.outcome_key,
+                outcome_name=contract.outcome_name,
+                token_id=contract.yes_instrument_id,
+                price=order_price,
+                shares=shares,
+                amount_usd=amount_usd,
+                edge=edge,
+                polymarket_ask=polymarket.yes_ask,
+                kalshi_bid=kalshi.yes_bid,
+                dry_run=True,
+                created_at_ms=at_ms,
+                status="FILLED",
+            )
+            self._add_position_from_buy(pending)
+            await self._record_order("dry_run_buy", pending, {"status": "FILLED", "reason": reason})
+            self._notify_buy(pending, "DRY RUN BUY")
+            return
+        if not self._ws_ready.is_set():
+            LOG.warning("live buy skipped: polymarket user websocket is not ready for order confirmation")
+            self._notify(
+                "*LIVE BUY SKIPPED*\n"
+                "Reason: Polymarket user websocket is not ready for confirmation\n"
+                f"Match: `{contract.match_id}`\n"
+                f"Outcome: *{contract.outcome_name}*\n"
+                f"Edge: {edge * 100:.2f}%"
+            )
+            return
+        result = await asyncio.to_thread(
+            self.executor.place_buy_order,
+            contract.yes_instrument_id,
+            amount_usd,
+            order_price,
+        )
+        if not result.success:
+            await self.writer.append("orders", {
+                "received_at_ms": now_ms(),
+                "received_at": iso_ms(now_ms()),
+                "event": "buy_rejected",
+                "match_id": contract.match_id,
+                "outcome_key": contract.outcome_key,
+                "price": order_price,
+                "edge": edge,
+                "reason": reason,
+                "error": result.error,
+            })
+            self._notify(
+                "*LIVE BUY REJECTED*\n"
+                f"Match: `{contract.match_id}`\n"
+                f"Outcome: *{contract.outcome_name}*\n"
+                f"Price: ${order_price:.2f}\n"
+                f"Edge: {edge * 100:.2f}%\n"
+                f"Error: `{result.error[:180]}`"
+            )
+            return
+        pending = PendingBuy(
+            side="BUY",
+            order_id=result.order_id,
+            match_id=contract.match_id,
+            outcome_key=contract.outcome_key,
+            outcome_name=contract.outcome_name,
+            token_id=contract.yes_instrument_id,
+            price=result.price or order_price,
+            shares=result.shares,
+            amount_usd=result.amount_usd,
+            edge=edge,
+            polymarket_ask=polymarket.yes_ask,
+            kalshi_bid=kalshi.yes_bid,
+            dry_run=False,
+            created_at_ms=at_ms,
+        )
+        self.pending_by_order_id[pending.order_id] = pending
+        await self._record_order("live_buy_submitted", pending, {"status": result.status, "reason": reason})
+        self._notify_buy(pending, "LIVE BUY SUBMITTED")
+
+    async def _submit_sell(self, position: Position, polymarket_bid: float, kalshi_bid: float, exit_edge: float, reason: str) -> None:
+        sell_price = round(float(polymarket_bid), 2)
+        at_ms = now_ms()
+        pending = PendingBuy(
+            side="SELL",
+            order_id=f"DRY-SELL-{at_ms}" if self.dry_run else "",
+            match_id=position.match_id,
+            outcome_key=position.outcome_key,
+            outcome_name=position.outcome_name,
+            token_id=position.token_id,
+            price=sell_price,
+            shares=position.shares,
+            amount_usd=position.shares * sell_price,
+            edge=exit_edge,
+            polymarket_ask=sell_price,
+            kalshi_bid=kalshi_bid,
+            dry_run=self.dry_run,
+            created_at_ms=at_ms,
+            status="FILLED" if self.dry_run else "PENDING",
+        )
+        if self.dry_run:
+            self.positions.pop((position.match_id, position.outcome_key), None)
+            await self._record_order("dry_run_sell", pending, {
+                "status": "FILLED",
+                "reason": reason,
+                "entry_price": position.avg_price,
+                "estimated_pnl": (sell_price - position.avg_price) * position.shares,
+            })
+            self._notify_sell(pending, "DRY RUN SELL", position.avg_price)
+            return
+        if not self._ws_ready.is_set():
+            LOG.warning("live sell skipped: polymarket user websocket is not ready for order confirmation")
+            return
+        result = await asyncio.to_thread(
+            self.executor.place_sell_order,
+            position.token_id,
+            position.shares,
+            sell_price,
+        )
+        if not result.success:
+            await self.writer.append("orders", {
+                "received_at_ms": now_ms(),
+                "received_at": iso_ms(now_ms()),
+                "event": "sell_rejected",
+                "match_id": position.match_id,
+                "outcome_key": position.outcome_key,
+                "price": sell_price,
+                "edge": exit_edge,
+                "reason": reason,
+                "error": result.error,
+            })
+            self._notify(
+                "*LIVE SELL REJECTED*\n"
+                f"Match: `{position.match_id}`\n"
+                f"Outcome: *{position.outcome_name}*\n"
+                f"Price: ${sell_price:.2f}\n"
+                f"Exit edge: {exit_edge * 100:.2f}%\n"
+                f"Error: `{result.error[:180]}`"
+            )
+            return
+        pending.order_id = result.order_id
+        pending.price = result.price or sell_price
+        pending.shares = result.shares or position.shares
+        pending.amount_usd = result.amount_usd or pending.shares * pending.price
+        self.pending_by_order_id[pending.order_id] = pending
+        await self._record_order("live_sell_submitted", pending, {
+            "status": result.status,
+            "reason": reason,
+            "entry_price": position.avg_price,
+        })
+        self._notify_sell(pending, "LIVE SELL SUBMITTED", position.avg_price)
+
+    async def _maybe_sweep_on_kalshi_ws_result(self, book: PriceBook, updated_price: PriceState) -> None:
+        if not self.result_sweep_enabled or updated_price.platform_id != "kalshi":
+            return
+        resolved_outcome_key = self._resolved_outcome_from_kalshi_tick(book, updated_price)
+        if resolved_outcome_key is None:
+            return
+        await self._sweep_polymarket_resolved_outcome(book, updated_price.match_id, resolved_outcome_key)
+
+    def _resolved_outcome_from_kalshi_tick(self, book: PriceBook, updated_price: PriceState) -> str | None:
+        yes_prices = [updated_price.yes_bid, updated_price.yes_ask, updated_price.last_trade_price]
+        if any(price is not None and price >= self.result_sweep_certainty_price for price in yes_prices):
+            return updated_price.outcome_key
+        no_prices = [updated_price.no_bid, updated_price.no_ask]
+        if not any(price is not None and price >= self.result_sweep_certainty_price for price in no_prices):
+            return None
+        other_outcomes = sorted({
+            price.outcome_key
+            for price in book.prices_for_match(updated_price.match_id)
+            if price.platform_id == "kalshi" and price.outcome_key != updated_price.outcome_key
+        })
+        return other_outcomes[0] if len(other_outcomes) == 1 else None
+
+    async def _sweep_polymarket_resolved_outcome(self, book: PriceBook, match_id: str, outcome_key: str) -> None:
+        if (match_id, outcome_key) in self.result_sweep_done:
+            return
+        if len(self.pending_by_order_id) >= self.max_open_orders:
+            return
+        polymarket_contract = self.contracts_by_platform_outcome.get(("polymarket", match_id, outcome_key))
+        kalshi_contract = self.contracts_by_platform_outcome.get(("kalshi", match_id, outcome_key))
+        if polymarket_contract is None or kalshi_contract is None:
+            return
+        polymarket_price = next((p for p in book.prices_for_outcome(match_id, outcome_key) if p.platform_id == "polymarket"), None)
+        if polymarket_price is None or polymarket_price.yes_ask is None:
+            return
+        if polymarket_price.yes_ask >= 0.995:
+            return
+        amount = await self._result_sweep_amount()
+        if amount <= 0:
+            return
+        synthetic_kalshi = PriceState(
+            match_id=match_id,
+            platform_id="kalshi",
+            outcome_key=outcome_key,
+            outcome_name=kalshi_contract.outcome_name,
+            instrument_id=kalshi_contract.yes_instrument_id,
+            yes_bid=1.0,
+            yes_ask=1.0,
+            updated_at_ms=now_ms(),
+        )
+        edge = 1.0 - polymarket_price.yes_ask
+        self.result_sweep_done.add((match_id, outcome_key))
+        await self._submit_buy(
+            polymarket_contract,
+            polymarket_price,
+            synthetic_kalshi,
+            edge,
+            now_ms(),
+            amount,
+            "kalshi_ws_0.99_result_sweep",
+        )
+
+    async def _result_sweep_amount(self) -> float:
+        if self.dry_run:
+            return self.result_sweep_max_usd if self.result_sweep_max_usd > 0 else self.trade_amount_usd
+        if self.executor is None:
+            return 0.0
+        balance = await asyncio.to_thread(self.executor.get_balance, True)
+        if self.result_sweep_max_usd > 0:
+            return min(balance, self.result_sweep_max_usd)
+        return balance
+
+    async def handle_user_message(self, message: str | bytes, received_ms: int) -> None:
+        text = message.decode("utf-8", errors="replace") if isinstance(message, bytes) else message
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        messages = payload if isinstance(payload, list) else [payload]
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            order_id, fill_price, fill_shares = self._matched_pending_order(msg)
+            if not order_id:
+                continue
+            pending = self.pending_by_order_id.pop(order_id, None)
+            if pending is None:
+                continue
+            if fill_price is not None:
+                pending.price = fill_price
+            if fill_shares is not None:
+                pending.shares = fill_shares
+            pending.amount_usd = pending.price * pending.shares
+            pending.status = "CONFIRMED"
+            if pending.side == "BUY":
+                self._add_position_from_buy(pending)
+                await self._record_order("live_buy_confirmed", pending, {"user_ws_message": msg})
+                self._notify_buy(pending, "LIVE BUY CONFIRMED")
+            else:
+                position = self.positions.pop((pending.match_id, pending.outcome_key), None)
+                await self._record_order("live_sell_confirmed", pending, {
+                    "user_ws_message": msg,
+                    "entry_price": position.avg_price if position else None,
+                    "estimated_pnl": ((pending.price - position.avg_price) * pending.shares) if position else None,
+                })
+                self._notify_sell(pending, "LIVE SELL CONFIRMED", position.avg_price if position else 0.0)
+
+    def _matched_pending_order(self, msg: dict[str, Any]) -> tuple[str | None, float | None, float | None]:
+        event_type = str(msg.get("event_type") or "").lower()
+        status = str(msg.get("status") or msg.get("type") or "").upper()
+        if event_type == "trade" or status in {"MATCHED", "TRADE"}:
+            taker_order_id = str(msg.get("taker_order_id") or "")
+            if taker_order_id in self.pending_by_order_id:
+                return taker_order_id, decimal(msg.get("price")), number(msg.get("size"))
+            for maker in msg.get("maker_orders") or []:
+                order_id = str(maker.get("order_id") or "")
+                if order_id in self.pending_by_order_id:
+                    return order_id, decimal(maker.get("price") or msg.get("price")), number(maker.get("matched_amount") or msg.get("size"))
+        if event_type == "order":
+            order_id = str(msg.get("id") or "")
+            size_matched = number(msg.get("size_matched"))
+            if order_id in self.pending_by_order_id and size_matched:
+                return order_id, decimal(msg.get("price")), size_matched
+        return None, None, None
+
+    def _add_position_from_buy(self, pending: PendingBuy) -> None:
+        key = (pending.match_id, pending.outcome_key)
+        existing = self.positions.get(key)
+        if existing is None:
+            self.positions[key] = Position(
+                match_id=pending.match_id,
+                outcome_key=pending.outcome_key,
+                outcome_name=pending.outcome_name,
+                token_id=pending.token_id,
+                shares=pending.shares,
+                avg_price=pending.price,
+                amount_usd=pending.amount_usd,
+                entry_edge=pending.edge,
+                dry_run=pending.dry_run,
+                opened_at_ms=now_ms(),
+            )
+            return
+        total_shares = existing.shares + pending.shares
+        if total_shares <= 0:
+            return
+        existing.avg_price = ((existing.avg_price * existing.shares) + (pending.price * pending.shares)) / total_shares
+        existing.shares = total_shares
+        existing.amount_usd += pending.amount_usd
+
+    async def _record_order(self, event: str, pending: PendingBuy, extra: dict[str, Any]) -> None:
+        received_ms = now_ms()
+        await self.writer.append("orders", {
+            "received_at_ms": received_ms,
+            "received_at": iso_ms(received_ms),
+            "event": event,
+            "order_id": pending.order_id,
+            "match_id": pending.match_id,
+            "outcome_key": pending.outcome_key,
+            "outcome_name": pending.outcome_name,
+            "token_id": pending.token_id,
+            "price": pending.price,
+            "shares": pending.shares,
+            "amount_usd": pending.amount_usd,
+            "edge": pending.edge,
+            "polymarket_ask": pending.polymarket_ask,
+            "kalshi_bid": pending.kalshi_bid,
+            "dry_run": pending.dry_run,
+            "status": pending.status,
+            **extra,
+        })
+
+    def _notify_buy(self, pending: PendingBuy, title: str) -> None:
+        self._notify(
+            f"*{title}*\n"
+            f"Match: `{pending.match_id}`\n"
+            f"Outcome: *{pending.outcome_name}*\n"
+            f"Polymarket YES ask: ${pending.polymarket_ask:.3f}\n"
+            f"Kalshi YES bid: ${pending.kalshi_bid:.3f}\n"
+            f"Edge: *{pending.edge * 100:.2f}%*\n"
+            f"Buy: ${pending.amount_usd:.2f} @ ${pending.price:.2f}\n"
+            f"Shares: {pending.shares:.2f}\n"
+            f"Order: `{pending.order_id}`"
+        )
+
+    def _notify_sell(self, pending: PendingBuy, title: str, entry_price: float) -> None:
+        estimated_pnl = (pending.price - entry_price) * pending.shares if entry_price else 0.0
+        self._notify(
+            f"*{title}*\n"
+            f"Match: `{pending.match_id}`\n"
+            f"Outcome: *{pending.outcome_name}*\n"
+            f"Sell price: ${pending.price:.2f}\n"
+            f"Entry price: ${entry_price:.2f}\n"
+            f"Kalshi YES bid: ${pending.kalshi_bid:.3f}\n"
+            f"Exit edge: *{pending.edge * 100:.2f}%*\n"
+            f"Shares: {pending.shares:.2f}\n"
+            f"Estimated P&L: ${estimated_pnl:+.2f}\n"
+            f"Order: `{pending.order_id}`"
+        )
+
+    def _notify(self, message: str) -> None:
+        if self.telegram is not None:
+            self.telegram.send(message)
+        else:
+            LOG.info("telegram disabled; notification=%s", message)
 
 
 class EdgeAnalyzer:
@@ -339,14 +925,29 @@ class SportsPriceBot:
         self.matches = load_matches(config, match_id)
         self.contracts = contracts_from_matches(self.matches)
         if not self.contracts:
-            raise ValueError("No contracts found in config. Check price-monitor.manual-matches.")
+            details = []
+            for match in self.matches:
+                details.append(
+                    "%s pm_url=%s kalshi_url=%s error=%s" % (
+                        match.get("match-id") or "<missing match-id>",
+                        match.get("polymarket-url") or "",
+                        match.get("kalshi-url") or "",
+                        match.get("_resolve_error") or "",
+                    )
+                )
+            raise ValueError(
+                "No contracts found in config. URL auto-resolution did not produce "
+                "polymarket-contracts/kalshi-contracts. Details: " + "; ".join(details)
+            )
         self.writer = JsonlWriter(output_dir)
         self.book = PriceBook(self.contracts)
         self.analyzer = EdgeAnalyzer(config, self.writer)
+        self.trade_manager = TradeManager(config, self.writer, self.contracts)
         self.stop_event = asyncio.Event()
 
     async def run(self) -> None:
         LOG.info("loaded %s matches and %s contracts", len(self.matches), len(self.contracts))
+        self.trade_manager.initialize()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -356,6 +957,7 @@ class SportsPriceBot:
         tasks = [
             asyncio.create_task(self._run_polymarket(), name="polymarket"),
             asyncio.create_task(self._run_kalshi(), name="kalshi"),
+            asyncio.create_task(self.trade_manager.start_user_ws(self.stop_event), name="polymarket-user"),
         ]
         await self.stop_event.wait()
         for task in tasks:
@@ -463,6 +1065,7 @@ class SportsPriceBot:
         if price:
             await self._record_tick(message_type, price, received_ms)
             await self.analyzer.on_price(self.book, price)
+            await self.trade_manager.evaluate(self.book, price)
 
     async def _handle_kalshi(self, message: str | bytes, received_ms: int) -> None:
         text = message.decode("utf-8", errors="replace") if isinstance(message, bytes) else message
@@ -498,6 +1101,7 @@ class SportsPriceBot:
         if price:
             await self._record_tick("ticker", price, received_ms)
             await self.analyzer.on_price(self.book, price)
+            await self.trade_manager.evaluate(self.book, price)
 
     async def _record_tick(self, message_type: str, price: PriceState, received_ms: int) -> None:
         await self.writer.append(
@@ -620,6 +1224,15 @@ def decimal(value: Any) -> float | None:
     return parsed / 100.0 if parsed > 1.0 else parsed
 
 
+def number(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def first_value(values: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         value = values.get(key)
@@ -648,6 +1261,10 @@ def now_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+def iso_ms(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="milliseconds")
+    
+
 def find_matching_kalshi_market(pm_outcome: str, kalshi_markets: list[dict]) -> dict | None:
     pm_clean = pm_outcome.lower().replace(".", "").replace(",", "")
     pm_words = set(pm_clean.split())
@@ -673,23 +1290,70 @@ def find_matching_kalshi_market(pm_outcome: str, kalshi_markets: list[dict]) -> 
     return best_market
 
 
-async def resolve_match_from_urls(pm_url: str, kalshi_url: str) -> dict[str, Any]:
+def fetch_json(url: str) -> Any:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as res:
+        return json.loads(res.read().decode("utf-8"))
+
+
+def first_list_item(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, list) and value and isinstance(value[0], dict):
+        return value[0]
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+def first_query_value(query: dict[str, list[str]], key: str) -> str | None:
+    values = query.get(key)
+    if not values:
+        return None
+    value = values[0]
+    return value if value else None
+
+
+def choose_polymarket_market(event_data: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not event_data:
+        return None
+    markets = event_data.get("markets") or []
+    if not isinstance(markets, list):
+        return None
+    candidates = [market for market in markets if isinstance(market, dict)]
+    if not candidates:
+        return None
+    moneyline_words = ("moneyline", "winner", "win the match", "win the game")
+    for market in candidates:
+        text = " ".join(str(market.get(key) or "") for key in ("question", "title", "description", "groupItemTitle")).lower()
+        if any(word in text for word in moneyline_words) and market.get("clobTokenIds"):
+            return market
+    for market in candidates:
+        if market.get("clobTokenIds"):
+            return market
+    return candidates[0]
+
+
+async def resolve_match_from_urls(pm_url: str, kalshi_url: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
     pm_url_clean = pm_url.split("?")[0].rstrip("/")
     pm_slug = pm_url_clean.split("/")[-1]
-    
-    pm_api_url = f"https://gamma-api.polymarket.com/markets?slug={pm_slug}"
     loop = asyncio.get_event_loop()
-    
-    def fetch_pm():
-        req = urllib.request.Request(pm_api_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req) as res:
-            return json.loads(res.read().decode("utf-8"))
-            
-    pm_data = await loop.run_in_executor(None, fetch_pm)
-    if not pm_data or not isinstance(pm_data, list):
-        raise ValueError(f"Could not find Polymarket market details for slug: {pm_slug}")
-        
-    market_data = pm_data[0]
+
+    pm_data = await loop.run_in_executor(
+        None,
+        fetch_json,
+        f"https://gamma-api.polymarket.com/markets?slug={quote(pm_slug)}",
+    )
+    market_data = first_list_item(pm_data)
+    event_data = None
+    if market_data is None:
+        event_data = first_list_item(await loop.run_in_executor(
+            None,
+            fetch_json,
+            f"https://gamma-api.polymarket.com/events?slug={quote(pm_slug)}",
+        ))
+        market_data = choose_polymarket_market(event_data)
+    if market_data is None:
+        raise ValueError(f"Could not find Polymarket market/event details for slug: {pm_slug}")
+
     pm_event_id = f"polymarket#{pm_slug}"
     
     pm_outcomes = market_data.get("outcomes")
@@ -702,21 +1366,25 @@ async def resolve_match_from_urls(pm_url: str, kalshi_url: str) -> dict[str, Any
     if not pm_outcomes or not pm_tokens or len(pm_outcomes) != len(pm_tokens):
         raise ValueError("Invalid outcome or token structure in Polymarket response")
         
+    parsed_kalshi_url = urlparse(kalshi_url)
+    query = parse_qs(parsed_kalshi_url.query)
+    op_market_ticker = first_query_value(query, "op_market_ticker")
     kalshi_url_clean = kalshi_url.split("?")[0].rstrip("/")
     kalshi_event_ticker = kalshi_url_clean.split("/")[-1].upper()
     kalshi_event_id = f"kalshi#{kalshi_event_ticker}"
-    
-    kalshi_api_url = f"https://api.kalshi.com/trade-api/v2/markets?event_ticker={kalshi_event_ticker}"
-    
-    def fetch_kalshi():
-        req = urllib.request.Request(kalshi_api_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req) as res:
-            return json.loads(res.read().decode("utf-8"))
-            
-    kalshi_data = await loop.run_in_executor(None, fetch_kalshi)
+
+    kalshi_base_url = (config or {}).get("kalshi-rest-base-url") or "https://api.elections.kalshi.com/trade-api/v2"
+    kalshi_data = await loop.run_in_executor(
+        None,
+        fetch_json,
+        f"{kalshi_base_url.rstrip('/')}/markets?event_ticker={quote(kalshi_event_ticker)}",
+    )
     kalshi_markets = kalshi_data.get("markets") or []
     if not kalshi_markets:
         raise ValueError(f"No markets found for Kalshi event ticker: {kalshi_event_ticker}")
+    if op_market_ticker:
+        op_market_ticker = op_market_ticker.upper()
+        kalshi_markets = sorted(kalshi_markets, key=lambda market: 0 if market.get("ticker") == op_market_ticker else 1)
         
     pm_contracts = []
     kalshi_contracts = []
@@ -741,11 +1409,17 @@ async def resolve_match_from_urls(pm_url: str, kalshi_url: str) -> dict[str, Any
             "outcome-name": pm_outcome,
             "yes-instrument-id": matching_market["ticker"]
         })
-        
+
+    if len(pm_contracts) != len(pm_outcomes) or len(kalshi_contracts) != len(pm_outcomes):
+        raise ValueError(
+            "Could not map all Polymarket outcomes to Kalshi markets. "
+            f"polymarket_outcomes={pm_outcomes} kalshi_market_tickers={[m.get('ticker') for m in kalshi_markets]}"
+        )
+
     match_id = f"dynamic-{pm_slug}"
     return {
         "match-id": match_id,
-        "name": market_data.get("question") or f"{pm_slug} Moneyline",
+        "name": market_data.get("question") or (event_data or {}).get("title") or f"{pm_slug} Moneyline",
         "polymarket-event-id": pm_event_id,
         "kalshi-event-id": kalshi_event_id,
         "polymarket-url": pm_url,
@@ -764,9 +1438,10 @@ async def resolve_config_matches(config: dict[str, Any]) -> None:
             if pm_url and kalshi_url:
                 LOG.info("Dynamically resolving contracts for match: %s", match.get("name") or match.get("match-id"))
                 try:
-                    resolved = await resolve_match_from_urls(pm_url, kalshi_url)
+                    resolved = await resolve_match_from_urls(pm_url, kalshi_url, config)
                     match.update(resolved)
                 except Exception as e:
+                    match["_resolve_error"] = str(e)
                     LOG.error("Failed to resolve contracts for %s: %s", pm_url, e)
 
 
@@ -797,7 +1472,7 @@ async def async_main() -> None:
             pass
         
         LOG.info("Dynamically resolving match from command line URLs...")
-        resolved_match = await resolve_match_from_urls(args.polymarket_url, args.kalshi_url)
+        resolved_match = await resolve_match_from_urls(args.polymarket_url, args.kalshi_url, config)
         config["manual-matches"] = [resolved_match]
         args.match_id = resolved_match["match-id"]
         bot = SportsPriceBot(config, args.output_dir, args.match_id)
