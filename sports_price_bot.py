@@ -9,6 +9,7 @@ import logging
 import os
 import signal
 import time
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -647,8 +648,126 @@ def now_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
-def iso_ms(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat(timespec="milliseconds")
+def find_matching_kalshi_market(pm_outcome: str, kalshi_markets: list[dict]) -> dict | None:
+    pm_clean = pm_outcome.lower().replace(".", "").replace(",", "")
+    pm_words = set(pm_clean.split())
+    
+    best_market = None
+    best_score = -1
+    
+    for market in kalshi_markets:
+        title = (market.get("title") or "").lower()
+        subtitle = (market.get("subtitle") or "").lower()
+        ticker = (market.get("ticker") or "").lower()
+        
+        if pm_clean in title or pm_clean in subtitle or pm_clean in ticker:
+            return market
+        
+        market_text = f"{title} {subtitle} {ticker}"
+        market_words = set(market_text.replace(".", "").replace(",", "").split())
+        overlap = len(pm_words.intersection(market_words))
+        if overlap > best_score:
+            best_score = overlap
+            best_market = market
+            
+    return best_market
+
+
+async def resolve_match_from_urls(pm_url: str, kalshi_url: str) -> dict[str, Any]:
+    pm_url_clean = pm_url.split("?")[0].rstrip("/")
+    pm_slug = pm_url_clean.split("/")[-1]
+    
+    pm_api_url = f"https://gamma-api.polymarket.com/markets?slug={pm_slug}"
+    loop = asyncio.get_event_loop()
+    
+    def fetch_pm():
+        req = urllib.request.Request(pm_api_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as res:
+            return json.loads(res.read().decode("utf-8"))
+            
+    pm_data = await loop.run_in_executor(None, fetch_pm)
+    if not pm_data or not isinstance(pm_data, list):
+        raise ValueError(f"Could not find Polymarket market details for slug: {pm_slug}")
+        
+    market_data = pm_data[0]
+    pm_event_id = f"polymarket#{pm_slug}"
+    
+    pm_outcomes = market_data.get("outcomes")
+    if isinstance(pm_outcomes, str):
+        pm_outcomes = json.loads(pm_outcomes)
+    pm_tokens = market_data.get("clobTokenIds")
+    if isinstance(pm_tokens, str):
+        pm_tokens = json.loads(pm_tokens)
+        
+    if not pm_outcomes or not pm_tokens or len(pm_outcomes) != len(pm_tokens):
+        raise ValueError("Invalid outcome or token structure in Polymarket response")
+        
+    kalshi_url_clean = kalshi_url.split("?")[0].rstrip("/")
+    kalshi_event_ticker = kalshi_url_clean.split("/")[-1].upper()
+    kalshi_event_id = f"kalshi#{kalshi_event_ticker}"
+    
+    kalshi_api_url = f"https://api.kalshi.com/trade-api/v2/markets?event_ticker={kalshi_event_ticker}"
+    
+    def fetch_kalshi():
+        req = urllib.request.Request(kalshi_api_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as res:
+            return json.loads(res.read().decode("utf-8"))
+            
+    kalshi_data = await loop.run_in_executor(None, fetch_kalshi)
+    kalshi_markets = kalshi_data.get("markets") or []
+    if not kalshi_markets:
+        raise ValueError(f"No markets found for Kalshi event ticker: {kalshi_event_ticker}")
+        
+    pm_contracts = []
+    kalshi_contracts = []
+    
+    for i, pm_outcome in enumerate(pm_outcomes):
+        outcome_key = pm_outcome.lower().replace(" ", "-")
+        matching_market = find_matching_kalshi_market(pm_outcome, kalshi_markets)
+        if not matching_market:
+            if i < len(kalshi_markets):
+                matching_market = kalshi_markets[i]
+            else:
+                continue
+                
+        pm_contracts.append({
+            "outcome-key": outcome_key,
+            "outcome-name": pm_outcome,
+            "yes-instrument-id": pm_tokens[i]
+        })
+        
+        kalshi_contracts.append({
+            "outcome-key": outcome_key,
+            "outcome-name": pm_outcome,
+            "yes-instrument-id": matching_market["ticker"]
+        })
+        
+    match_id = f"dynamic-{pm_slug}"
+    return {
+        "match-id": match_id,
+        "name": market_data.get("question") or f"{pm_slug} Moneyline",
+        "polymarket-event-id": pm_event_id,
+        "kalshi-event-id": kalshi_event_id,
+        "polymarket-url": pm_url,
+        "kalshi-url": kalshi_url,
+        "polymarket-contracts": pm_contracts,
+        "kalshi-contracts": kalshi_contracts
+    }
+
+
+async def resolve_config_matches(config: dict[str, Any]) -> None:
+    matches = config.get("manual-matches") or []
+    for match in matches:
+        if not match.get("polymarket-contracts") or not match.get("kalshi-contracts"):
+            pm_url = match.get("polymarket-url")
+            kalshi_url = match.get("kalshi-url")
+            if pm_url and kalshi_url:
+                LOG.info("Dynamically resolving contracts for match: %s", match.get("name") or match.get("match-id"))
+                try:
+                    resolved = await resolve_match_from_urls(pm_url, kalshi_url)
+                    match.update(resolved)
+                except Exception as e:
+                    LOG.error("Failed to resolve contracts for %s: %s", pm_url, e)
 
 
 def parse_args() -> argparse.Namespace:
@@ -656,6 +775,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("src/main/resources/application.yml"))
     parser.add_argument("--output-dir", type=Path, default=Path("data/realtime"))
     parser.add_argument("--match-id", help="Only monitor one configured manual match id.")
+    parser.add_argument("--polymarket-url", help="Polymarket market URL to monitor dynamically.")
+    parser.add_argument("--kalshi-url", help="Kalshi market URL to monitor dynamically.")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -663,7 +784,28 @@ def parse_args() -> argparse.Namespace:
 async def async_main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    bot = SportsPriceBot(load_config(args.config), args.output_dir, args.match_id)
+    
+    if args.polymarket_url and args.kalshi_url:
+        config = {
+            "polymarket-ws-url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+            "kalshi-ws-url": "wss://api.elections.kalshi.com/trade-api/ws/v2",
+        }
+        try:
+            default_config = load_config(args.config)
+            config.update(default_config)
+        except Exception:
+            pass
+        
+        LOG.info("Dynamically resolving match from command line URLs...")
+        resolved_match = await resolve_match_from_urls(args.polymarket_url, args.kalshi_url)
+        config["manual-matches"] = [resolved_match]
+        args.match_id = resolved_match["match-id"]
+        bot = SportsPriceBot(config, args.output_dir, args.match_id)
+    else:
+        config = load_config(args.config)
+        await resolve_config_matches(config)
+        bot = SportsPriceBot(config, args.output_dir, args.match_id)
+        
     await bot.run()
 
 
